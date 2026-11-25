@@ -5,6 +5,7 @@
 * ``GET  /``                         健康检查
 * ``POST /api/v1/models/load``       按车型录入配对并拆成备件表/工况表
 * ``POST /api/v1/models/correct``    已入库车型成批更正组合有无
+* ``POST /api/v1/models/screen``     厂商补报只读筛选：可采纳清单 / 待补证清单
 * ``GET  /api/v1/models/{model_id}`` 一次返回该车型同时生效的两张表
 * ``GET  /api/v1/models``            车型清单
 """
@@ -22,6 +23,8 @@ from .schemas import (
     LoadRequest,
     ModelListResponse,
     ModelResponse,
+    ScreenRequest,
+    ScreenResponse,
 )
 
 
@@ -104,6 +107,37 @@ def load_model(payload: LoadRequest) -> ModelResponse:
 )
 def correct_model(payload: CorrectionRequest) -> ModelResponse:
     return service.apply_correction(payload.model_id, payload.plus, payload.minus)
+
+
+@app.post(
+    "/api/v1/models/screen",
+    response_model=ScreenResponse,
+    tags=["models"],
+    summary="厂商补报只读筛选：拆出可采纳清单与待补证清单（不写库）",
+    responses={
+        404: {"description": "车型不存在"},
+        422: {
+            "description": (
+                "补报为空，或新备件号种数超过每批 12 个上限；"
+                "基准两表与在库数据均不发生任何改动"
+            ),
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "每批最多含 12 个基准备件表中没有的备件号，本批出现 13 个，请拆批后重新提交",
+                            "newPartNoCount": 13,
+                            "limit": 12,
+                            "newPartNos": ["P-N01", "P-N02"],
+                        }
+                    }
+                }
+            },
+        },
+    },
+)
+def screen_supplement(payload: ScreenRequest) -> ScreenResponse:
+    return service.screen_supplement(payload.model_id, payload.pairs)
 
 
 @app.get(

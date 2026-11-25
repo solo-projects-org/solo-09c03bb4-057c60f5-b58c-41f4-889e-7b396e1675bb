@@ -36,6 +36,9 @@ if TYPE_CHECKING:
 # SQLite 单文件多连接写入需串行化，所有写事务走同一把进程内锁。
 _write_lock = threading.RLock()
 
+# 每批补报最多含多少个基准备件表中没有的新备件号（硬上限，超出拒绝并提示拆批）。
+MAX_NEW_PART_NOS_PER_BATCH = 12
+
 
 # --------------------------------------------------------------------------- #
 # 工具函数
@@ -568,6 +571,235 @@ def list_models() -> dict:
                 }
                 for r in rows
             ]
+        }
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# 4. 厂商补报筛选（只读，不写库；不展开在库全量配对）
+# --------------------------------------------------------------------------- #
+def screen_supplement(model_id: str, pairs: list["Pair"]) -> dict:
+    """把厂商补报拆成"可采纳清单"与"待补证清单"。
+
+    基准：同一已提交状态下的在库备件表 ``P`` 与工况表 ``C``（其笛卡尔积
+    即全部在库配对，本身是完整矩形）。处理步骤：
+
+    1. 补报配对按 ``(备件, 工况)`` 去重；
+    2. 逐对做**成员判定**（备件是否在 P、工况是否在 C）剔除已在库配对——
+       判定只查两张单表，不 JOIN、不物化 ``P × C`` 在库全量配对；
+    3. 校验本批新备件号种数 ≤ ``MAX_NEW_PART_NOS_PER_BATCH``，超出直接 422；
+    4. 在剩余补报上求一个最大可并入子集，使
+
+           在库矩形 P × C  与  可采纳配对 A  的并集仍是完整矩形，
+
+       因而仍能由原两张表无损存储。
+
+    组合刻画（``Q``=采纳的新备件、``D``=采纳的新工况）：
+
+      * 每个 ``q ∈ Q`` 必须覆盖全部在库工况（``{c ∈ C: (q,c) 在补报} = C``）；
+      * 每个 ``d ∈ D`` 必须被全部在库备件覆盖（``{p ∈ P: (p,d) 在补报} = P``）；
+      * 每条 ``q × d``（q ∈ Q, d ∈ D）边都必须在补报中。
+
+    新备件上限 12 使枚举全部 ``Q`` 子集（至多 2^12=4096 个）精确且廉价；
+    对每个 ``Q``，可行新工况集合是确定的（被 P 全覆盖且与 Q 边齐），全部
+    纳入即可让采纳配对数最大，故枚举能取到全局最优，复杂度与在库配对总数无关。
+    """
+    model_id = model_id.strip()
+    if not model_id:
+        raise HTTPException(status_code=422, detail="model_id 不能为空")
+    submitted = _normalize_pairs(pairs)
+    if not submitted:
+        raise HTTPException(status_code=422, detail="补报配对列表不能为空")
+
+    # 只读路径：独立连接、不持写锁、绝不执行任何写语句。
+    conn = get_connection()
+    try:
+        model = conn.execute(
+            "SELECT 1 FROM vehicle_models WHERE model_id = ?", (model_id,)
+        ).fetchone()
+        if not model:
+            raise HTTPException(status_code=404, detail=f"车型 {model_id} 不存在")
+
+        # 两张基准表各自单表读取（不 JOIN、不拼回配对）。
+        base_parts = set(
+            r["part_no"]
+            for r in conn.execute(
+                "SELECT part_no FROM model_parts WHERE model_id = ?", (model_id,)
+            )
+        )
+        base_conds = set(
+            r["condition_code"]
+            for r in conn.execute(
+                "SELECT condition_code FROM model_conditions WHERE model_id = ?",
+                (model_id,),
+            )
+        )
+
+        # ---- 1) 成员判定剔除已在库配对（不展开 P × C）----
+        fresh: list[tuple[str, str]] = []
+        duplicate_in_warehouse = 0
+        new_part_nos: set[str] = set()
+        for part, cond in submitted:
+            if part in base_parts and cond in base_conds:
+                # 在库配对由两表笛卡尔积隐式表达，补报中的重复只算一次、直接剔除。
+                duplicate_in_warehouse += 1
+                continue
+            fresh.append((part, cond))
+            if part not in base_parts:
+                new_part_nos.add(part)
+
+        if len(new_part_nos) > MAX_NEW_PART_NOS_PER_BATCH:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": (
+                        f"每批最多含 {MAX_NEW_PART_NOS_PER_BATCH} 个基准备件表中没有的备件号，"
+                        f"本批出现 {len(new_part_nos)} 个，请拆批后重新提交"
+                    ),
+                    "newPartNoCount": len(new_part_nos),
+                    "limit": MAX_NEW_PART_NOS_PER_BATCH,
+                    "newPartNos": sorted(new_part_nos),
+                },
+            )
+
+        fresh_set = set(fresh)
+        # 按备件/工况索引补报，成员查询 O(1)，全程不接触在库配对全集。
+        conds_of_part: dict[str, set[str]] = {}
+        parts_of_cond: dict[str, set[str]] = {}
+        for part, cond in fresh:
+            conds_of_part.setdefault(part, set()).add(cond)
+            parts_of_cond.setdefault(cond, set()).add(part)
+
+        # ---- 2) 可行新备件：覆盖全部在库工况 C ----
+        eligible_new_parts = sorted(
+            p
+            for p in new_part_nos
+            if base_conds.issubset(conds_of_part.get(p, set()))
+        )
+        # ---- 3) 可行新工况：被全部在库备件 P 覆盖 ----
+        fresh_conds = {c for _, c in fresh}
+        eligible_new_conds = sorted(
+            c
+            for c in fresh_conds
+            if c not in base_conds and base_parts.issubset(parts_of_cond.get(c, set()))
+        )
+
+        # ---- 4) 枚举新备件子集（含空集），为每个子集取确定的可行新工况全集 ----
+        best_parts: tuple[str, ...] = ()
+        best_conds: tuple[str, ...] = ()
+        best_score = -1
+        n_eligible = len(eligible_new_parts)
+        for mask in range(1 << n_eligible):
+            chosen_parts = tuple(
+                eligible_new_parts[i] for i in range(n_eligible) if mask & (1 << i)
+            )
+            # 可行新工况：被 P 全覆盖，且与每个选中新备件之间的边都在补报中。
+            feasible_conds = tuple(
+                d
+                for d in eligible_new_conds
+                if all((q, d) in fresh_set for q in chosen_parts)
+            )
+            # 采纳配对数 = 新工况×在库备件 + 新备件×在库工况 + 新备件×新工况。
+            score = (
+                len(feasible_conds) * len(base_parts)
+                + len(chosen_parts) * len(base_conds)
+                + len(chosen_parts) * len(feasible_conds)
+            )
+            # 并列时确定性择优：先少引入新备件，再少引入新工况，最后字典序，
+            # 保证同一输入输出稳定、可解释。
+            if (
+                score > best_score
+                or (
+                    score == best_score
+                    and (
+                        len(chosen_parts) < len(best_parts)
+                        or (
+                            len(chosen_parts) == len(best_parts)
+                            and (
+                                len(feasible_conds) < len(best_conds)
+                                or (
+                                    len(feasible_conds) == len(best_conds)
+                                    and (chosen_parts, feasible_conds)
+                                    < (best_parts, best_conds)
+                                )
+                            )
+                        )
+                    )
+                )
+            ):
+                best_score = score
+                best_parts = chosen_parts
+                best_conds = feasible_conds
+
+        chosen_part_set = set(best_parts)
+        chosen_cond_set = set(best_conds)
+        eligible_part_set = set(eligible_new_parts)
+        eligible_cond_set = set(eligible_new_conds)
+
+        # ---- 5) 拆分可采纳 / 待补证 ----
+        acceptable: list[tuple[str, str]] = []
+        pending: list[dict] = []
+        for part, cond in fresh:
+            is_new_part = part not in base_parts
+            is_new_cond = cond not in base_conds
+            accepted = (
+                (not is_new_part or part in chosen_part_set)
+                and (not is_new_cond or cond in chosen_cond_set)
+            )
+            if accepted:
+                acceptable.append((part, cond))
+                continue
+
+            # 待补证原因按"个体证据是否齐全"判定（优先级：新备件不齐 > 新工况不齐
+            # > 个体齐全但受交叉边/全局最优矩形限制无法同时并入）。
+            if is_new_part and part not in eligible_part_set:
+                reason_code = "PART_INCOMPLETE"
+                reason = "新备件未覆盖全部在库工况，并入会拼出缺失组合，需补齐该备件的在库工况配对"
+            elif is_new_cond and cond not in eligible_cond_set:
+                reason_code = "CONDITION_INCOMPLETE"
+                reason = "新工况未被全部在库备件覆盖，并入会拼出缺失组合，需补齐各在库备件对该工况的配对"
+            else:
+                reason_code = "EDGE_MISSING"
+                reason = (
+                    "该配对涉及的新备件/新工况个体证据齐全，但受补报中相关交叉配对缺失的"
+                    "牵连，无法与最优可采纳矩形同时并入，需补齐关联交叉配对后整批重报"
+                )
+            pending.append(
+                {
+                    "part_no": part,
+                    "condition_code": cond,
+                    "reason_code": reason_code,
+                    "reason": reason,
+                }
+            )
+
+        acceptable.sort()
+        pending.sort(key=lambda d: (d["part_no"], d["condition_code"]))
+
+        return {
+            "model_id": model_id,
+            "baseline": {
+                "part_count": len(base_parts),
+                "condition_count": len(base_conds),
+                "effective_pair_count": len(base_parts) * len(base_conds),
+                "parts": sorted(base_parts),
+                "conditions": sorted(base_conds),
+            },
+            "acceptable_pairs": [
+                {"part_no": p, "condition_code": c} for p, c in acceptable
+            ],
+            "pending_pairs": pending,
+            "summary": {
+                "submitted_pair_count": len(submitted),
+                "duplicate_in_warehouse_count": duplicate_in_warehouse,
+                "new_part_no_count": len(new_part_nos),
+                "accepted_pair_count": len(acceptable),
+                "pending_pair_count": len(pending),
+                "accepted_new_part_count": len(best_parts),
+                "accepted_new_condition_count": len(best_conds),
+                "plus_ready": bool(acceptable),
+            },
         }
     finally:
         conn.close()
